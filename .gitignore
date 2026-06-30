@@ -1,0 +1,37 @@
+# Credentials and secrets
+*.env
+.env
+profiles.yml
+cred
+**/credentials*
+*.pem
+*.key
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Data — exclude full datasets, keep only samples
+data/bronze/
+data/silver/
+data/gold/
+csv_files/*.csv
+!csv_files/samples/*.csv
+
+# dbt
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+
+# Tableau extracts (large binary, exclude)
+Tableau/*.hyper
+Tableau/*.twbx
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

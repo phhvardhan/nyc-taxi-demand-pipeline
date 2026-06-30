@@ -1,0 +1,71 @@
+version: 2
+
+sources:
+  - name: raw
+    database: NYC_TAXI
+    schema: RAW
+    description: "Raw tables loaded via COPY INTO from S3 gold layer"
+    tables:
+      - name: hourly_zone_demand
+        description: "Hourly trip demand by pickup zone, written by Databricks gold job"
+        loaded_at_field: _loaded_at
+        freshness:
+          warn_after:  {count: 24, period: hour}
+          error_after: {count: 48, period: hour}
+      - name: daily_vendor_revenue
+      - name: monthly_payment_mix
+      - name: pipeline_health_log
+
+
+models:
+  - name: stg_hourly_zone_demand
+    description: "Staging view over RAW.hourly_zone_demand — typed, renamed, filtered"
+    columns:
+      - name: pickup_date
+        description: "Date of the pickup"
+        tests:
+          - not_null
+      - name: pickup_hour
+        description: "Hour of the pickup (0-23)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]
+      - name: pickup_location_id
+        description: "TLC zone ID for the pickup location"
+        tests:
+          - not_null
+      - name: trip_count
+        description: "Number of trips in this hour/zone"
+        tests:
+          - not_null
+      - name: avg_fare_amount
+        description: "Average fare for the hour/zone"
+        tests:
+          - not_null
+
+  - name: mart_demand_intelligence
+    description: "Incremental mart — hourly zone demand enriched with derived fields for Tableau"
+    columns:
+      - name: pickup_date
+        tests:
+          - not_null
+      - name: pickup_hour
+        tests:
+          - not_null
+      - name: pickup_location_id
+        tests:
+          - not_null
+      - name: demand_tier
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['HIGH', 'MEDIUM', 'LOW']
+      - name: time_segment
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['Morning Rush', 'Midday', 'Evening Rush', 'Night', 'Late Night']
+      - name: revenue_per_trip
+        tests:
+          - not_null
