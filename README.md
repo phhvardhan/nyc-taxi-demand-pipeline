@@ -1,102 +1,102 @@
 # NYC Taxi Demand Intelligence Pipeline
 
-**Built by:** Hema Harsha Vardhan Peela  
-**Stack:** Python · AWS S3 · Databricks (Spark) · Delta Lake · Snowflake · dbt · Tableau Public  
+**Built by:** Hema Harsha Vardhan Peela
+**Stack:** Python · AWS S3 · PySpark · Delta Lake · Snowflake · dbt · Tableau Public
 **Architecture:** Medallion (Bronze → Silver → Gold)
+**Live dashboard:** [Tableau Public](https://public.tableau.com/app/profile/harsha.peela/viz/NYCTaxiDemandIntelliigencePipeline/Dashboard2)
 
 ---
 
 ## The business problem
 
-NYC taxi operators and fleet dispatchers need real-time demand signals — which zones need drivers right now, what time-of-day patterns look like, and how revenue splits across vendors and payment types. This pipeline ingests TLC's public Yellow Taxi dataset and transforms it into actionable demand intelligence dashboards.
+NYC taxi operators and fleet dispatchers need real-time demand signals — which zones need drivers right now, what time-of-day patterns look like, and how revenue splits across vendors and payment types. This pipeline ingests TLC's public Yellow Taxi dataset and transforms it into actionable demand intelligence dashboards, with a parallel pipeline-health mart so data quality is monitored separately from the business numbers.
 
 ---
 
 ## Architecture
 
 ```
-NYC TLC Public S3
+NYC TLC Public S3 (Jan–Mar 2024 Yellow Taxi, ~9.5M raw rows)
         │
         ▼
-Python Ingestion (ingest.py)
-  · Retry with exponential backoff + jitter
-  · Row-level validation → quarantine bad rows
+Python Ingestion (ingestion/ingest.py)
+  · Retry with exponential backoff + full jitter
+  · Row-level validation → quarantine bad rows to a separate S3 path
   · MD5 checksum per file
-  · Control record written to S3 after every run
+  · Control record written to S3 after every run (audit trail)
         │
         ▼
 S3 Bronze (raw, immutable, partitioned by year/month)
-  · Original parquet, never mutated
-  · Replay point if transform logic changes
+  · Original parquet, never mutated — replay point if a transform bug is found
         │
         ▼
-Databricks Spark (notebooks/01_bronze_to_silver.py)
-  · Schema standardization + type casting
-  · Derived fields: duration, hour, day_of_week, time_segment
-  · Deduplication on surrogate key
-  · Writes Delta Lake → S3 Silver
+PySpark, run locally (transform/bronze_to_silver.py)
+  · Schema standardization + explicit type casting
+  · Derived fields: trip_duration_mins, pickup_hour, time_segment, is_weekend
+  · Deduplication on a natural key (vendor + pickup time + location + fare)
+  · Year-range filter to catch corrupt timestamps (see bugs below)
+  · Writes Delta Lake → local silver, 9.4M clean rows
         │
         ▼
-S3 Silver (clean Delta Lake, ACID, time travel enabled)
+PySpark (transform/silver_to_gold.py)
+  · 4 aggregated marts: hourly zone demand, daily vendor revenue,
+    monthly payment mix, pipeline health
+  · Uploaded to S3 Gold as Delta
         │
         ▼
-Databricks Spark (notebooks/02_silver_to_gold.py)
-  · 4 aggregated marts: hourly demand, daily revenue, payment mix, pipeline health
-  · Writes Delta → S3 Gold
-        │
-        ▼
-Snowflake (COPY INTO from S3 Gold via Storage Integration)
+Snowflake (load/snowflake_setup.sql)
+  · Storage integration + external stage reading S3 Gold directly
   · Two warehouses: TAXI_LOAD_WH (ingestion) · TAXI_BI_WH (serving)
-  · Auto-suspend 60s → near-zero idle cost
+  · Auto-suspend 60s/120s → near-zero idle cost
+  · COPY INTO with file-tracking metadata for incremental loads
         │
         ▼
-dbt (staging views + incremental marts)
-  · Typed staging views with dbt tests (not_null, unique, accepted_values)
-  · Incremental mart model with MERGE strategy
-  · Schema change policy: append_new_columns (non-breaking evolution)
+dbt (dbt_project/)
+  · Typed staging view with dbt tests (not_null, accepted_values)
+  · Incremental mart model, MERGE strategy on (date, hour, location_id)
+  · 14/14 tests passing
         │
         ▼
-Tableau Public (demand + pipeline health dashboards)
+Tableau Public — 4-panel live dashboard
+  · Demand by hour (colored by demand tier)
+  · Daily revenue by vendor
+  · Monthly payment mix
+  · Pipeline health monitor (row counts, null rates, freshness)
 ```
 
 ---
 
-## Key design decisions (what you say in interviews)
+## Real bugs found and fixed (these are the actual interview stories)
 
-### Why S3 bronze is immutable
-Raw files land once and are never mutated. If the silver transform has a bug, I replay from bronze without re-hitting the source. The source API is rate-limited — re-ingestion is expensive and fragile. Idempotency key: `year=YYYY/month=MM/filename.parquet`. Re-running the same month overwrites the same key.
+### 1. Corrupt timestamps from a 2024 dataset
+After the first bronze→silver run, the silver output contained trips dated 2002, 2008, and 2009 — clearly corrupt source rows that passed individual null/negative checks but failed on the calendar. Fixed with a year-range filter (`pickup_year BETWEEN 2023 AND 2025`, not a hardcoded `= 2024`) so legitimate late-arriving December trips from the prior year still pass.
 
-### Why Databricks Spark instead of Glue or pure SQL
-The pre-load work is heavy: parsing raw JSON/parquet, dedup on a composite key, SCD logic, and enrichment joins. Spark on Databricks does this cheaply in the distributed layer before touching Snowflake credits. If the logic were SQL-expressible and the data smaller, I'd flip to Snowpipe + dbt only.
+### 2. OutOfMemoryError on local Spark write
+Writing 9.5M rows from a single local JVM hit Java's default heap limit. Diagnosed as `java.lang.OutOfMemoryError: Java heap space` in the Parquet writer, fixed by setting `SPARK_DRIVER_MEMORY=4g` before launching the session — a real example of right-sizing compute for the actual data volume rather than assuming defaults are enough.
 
-### Why Delta Lake at silver
-Three things you get for free: ACID transactions (no partial writes), Time Travel (roll back to any Delta version), and Schema Enforcement (new unexpected columns fail loudly rather than silently coercing types). Schema evolution is explicit: I use `mergeSchema=true` only when I've reviewed the new field.
+### 3. Delta partition columns silently missing in Snowflake (the best one)
+After loading the `monthly_payment_mix` gold mart into Snowflake, every row had `pickup_year` and `pickup_month` as **NULL**, even though the values looked correct in Spark. Root cause: when Delta Lake writes with `.partitionBy("pickup_year", "pickup_month")`, those columns are stripped from the actual Parquet file content and encoded *only* in the S3 folder path (`pickup_year=2024/pickup_month=1/...`). The original `COPY INTO` was extracting from the JSON file body (`$1:pickup_year`), where the column no longer existed. Fixed by extracting the values from `METADATA$FILENAME` with `REGEXP_SUBSTR` against the partition path instead. This is the kind of bug that only surfaces when you trace a dashboard anomaly three layers back to its source — Tableau → Snowflake → S3 file structure.
 
-### Why two Snowflake warehouses
-Load and serve are different workloads with different performance profiles. Running both on one warehouse means dashboard queries contend with COPY INTO jobs during pipeline runs. Separate warehouses + auto-suspend keeps cost near zero and keeps Tableau snappy.
+### 4. Databricks Community Edition platform restrictions
+Originally planned to run the Spark transforms on Databricks Community Edition. Hit two hard platform walls: serverless compute blocks `spark.conf.set` for S3 credentials (`CONFIG_NOT_AVAILABLE` error, a deliberate multi-tenant security boundary), and the public DBFS root is disabled on free-tier accounts (`DBFS_DISABLED`). Pivoted to running the identical PySpark code locally with `delta-spark`, which is environment-agnostic — the same notebooks deploy unchanged to a real Databricks cluster.
 
-### How incremental loads work
-Ingestion tracks watermark via the S3 control record — last successful run timestamp per partition. Databricks reads only the new partitions. dbt's incremental model MERGEs on `(pickup_date, pickup_hour, pickup_location_id)` — new rows insert, changed rows update. Weekly full reconciliation catches hard deletes and missed updates the incremental path can't see.
+---
 
-### How schema evolution is handled
-Three layers:
-1. Spark reads with `mergeSchema=true` — new columns land in silver without failing the job
-2. dbt's `on_schema_change: append_new_columns` — new columns propagate to marts automatically
-3. Breaking changes (type changes, dropped required columns) fail loudly at the ingestion validation step — I'd rather know than silently load garbage
+## Key design decisions
 
-### Data quality
-- Ingestion: null checks, row count floor, non-negative distance/fare, pickup < dropoff
-- Bad rows → quarantine path in S3 (inspectable, not deleted)
-- Alert when reject rate > 5%
-- dbt tests: not_null, unique, accepted_values on every dimension column
-- Post-load: freshness check alerts if last load > 48 hours old
+**Why S3 bronze is immutable** — Raw files land once and are never mutated. If the silver transform has a bug, replay from bronze without re-hitting the rate-limited source. Idempotency key: `year=YYYY/month=MM/filename.parquet` — re-running the same month overwrites the same key rather than duplicating data.
 
-### Cost optimization
-- Spark transform on cheap S3 compute before loading to Snowflake (biggest lever)
-- Snowflake auto-suspend: 60s for load WH, 120s for BI WH
-- S3 lifecycle: bronze → Standard-IA after 30 days → Glacier after 90 days
-- Parquet + Snappy compression throughout (4–6x smaller than CSV)
-- Partition pruning on year/month: Spark and Snowflake only scan what they need
+**Why Spark instead of pure SQL/ELT** — The pre-load work is heavy: parsing raw parquet, dedup on a composite key, multi-field enrichment. Doing that in Spark on cheap compute before loading to Snowflake keeps warehouse credits focused on serving, not transformation.
+
+**Why Delta Lake at silver** — ACID transactions (no partial writes), Time Travel (roll back to any version), and schema enforcement (new unexpected columns fail loudly via `mergeSchema=true` rather than silently coercing types).
+
+**Why two Snowflake warehouses** — Load and serve are different workload profiles. One shared warehouse means COPY INTO jobs contend with Tableau queries for compute. Separate warehouses with aggressive auto-suspend keep both fast and keep idle cost near zero.
+
+**How incremental loads work** — Snowflake's COPY INTO tracks loaded files in metadata for 64 days; re-running against the same stage skips already-loaded files automatically (verified directly — a re-run showed `0 files processed`). New monthly gold files are picked up on the next scheduled run without manual intervention. A `PATTERN` filter excludes Delta's internal `_delta_log` and `.crc` files from being attempted.
+
+**Data quality, in layers** — Ingestion checks nulls, row-count floor, and business rules (non-negative fare/distance, pickup < dropoff), routing failures to a quarantine path rather than failing the whole batch. Silver adds a year-range filter for corrupt timestamps. dbt enforces `not_null` and `accepted_values` contracts on every dimension column before a mart is considered safe to serve. The pipeline_health mart tracks volume and null-rate trends separately, so a job can be "successful" while data quality is independently flagged — this caught a real, growing null-rate trend in `passenger_count` (4.7% in January → 11.7% in March) that traditional job monitoring would have missed entirely.
+
+**Cost optimization** — Local Spark compute for the heaviest transform work (free); Snowflake auto-suspend at 60s/120s; Parquet + Snappy throughout; partition pruning on year/month so queries scan only relevant data; S3 lifecycle policy aging bronze to Standard-IA after 30 days and Glacier after 90.
 
 ---
 
@@ -105,50 +105,39 @@ Three layers:
 ```
 nyc_taxi_pipeline/
 ├── config/
-│   ├── .env.example          # Environment variable template
-│   ├── settings.py           # Central config loaded from env
-│   └── s3_lifecycle.json     # S3 cost optimization policy
+│   ├── settings.py              # Central config loaded from env vars
+│   └── s3_lifecycle.json        # S3 cost optimization policy
 ├── ingestion/
-│   └── ingest.py             # Python: TLC → S3 bronze with retry + validation
-├── notebooks/
-│   ├── 01_bronze_to_silver.py  # Databricks: raw → clean Delta
-│   └── 02_silver_to_gold.py    # Databricks: clean → aggregated marts
+│   └── ingest.py                # TLC → S3 bronze, retry + validation + quarantine
+├── transform/
+│   ├── bronze_to_silver.py      # Local PySpark: raw → clean Delta
+│   └── silver_to_gold.py        # Local PySpark: clean → 4 aggregated marts
 ├── load/
-│   └── snowflake_setup.sql   # DDL, stage, COPY INTO, freshness check
+│   └── snowflake_setup.sql      # Warehouses, storage integration, COPY INTO, freshness check
 ├── dbt_project/
 │   ├── dbt_project.yml
 │   └── models/
 │       ├── staging/
 │       │   ├── stg_hourly_zone_demand.sql
-│       │   └── schema.yml    # Sources + dbt tests
+│       │   └── schema.yml       # Sources + dbt tests
 │       └── marts/
-│           └── mart_demand_intelligence.sql  # Incremental MERGE model
+│           └── mart_demand_intelligence.sql   # Incremental MERGE model
+├── csv_files/samples/           # Small data samples (full data lives in S3/Snowflake)
 ├── scripts/
-│   └── setup_day1.sh         # Mac setup script
+│   └── setup_day1.sh
 └── README.md
 ```
 
 ---
 
-## Day-by-day build log
+## Build status
 
-| Day | Goal | Done |
-|-----|------|------|
-| 1 | AWS setup, S3 buckets, ingestion script running locally | ☐ |
-| 2 | Databricks notebooks: bronze→silver→gold Delta | ☐ |
-| 3 | Snowflake load, dbt staging + marts, dbt test green | ☐ |
-| 4 | Tableau dashboards, README, pipeline health monitoring | ☐ |
-
----
-
-## Accounts to create (free/trial)
-
-| Service | URL | Cost |
-|---------|-----|------|
-| AWS | aws.amazon.com | ~$2–5 for S3 storage |
-| Databricks Community | community.cloud.databricks.com | Free |
-| Snowflake Trial | snowflake.com/try | $400 credits, 30 days |
-| Tableau Public | public.tableau.com | Free |
+| Day | Goal | Status |
+|-----|------|--------|
+| 1 | AWS setup, S3 buckets, ingestion script — 3 months / 9.5M rows landed | ✅ |
+| 2 | PySpark bronze→silver→gold, 2 real bugs found and fixed | ✅ |
+| 3 | Snowflake load via storage integration, dbt 14/14 tests passing | ✅ |
+| 4 | Tableau Public dashboard published, GitHub repo cleaned and pushed | ✅ |
 
 ---
 
@@ -156,21 +145,35 @@ nyc_taxi_pipeline/
 
 ```bash
 # 1. Setup
-chmod +x scripts/setup_day1.sh && ./scripts/setup_day1.sh
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt   # boto3, pandas, pyarrow, pyspark, delta-spark, dbt-snowflake
 
-# 2. Fill in your credentials
+# 2. Configure credentials (never commit these — see .gitignore)
 cp config/.env.example config/.env
-# Edit config/.env with your AWS + Snowflake values
+# Fill in AWS keys + S3 bucket name
 
-# 3. Run ingestion (downloads 1 month of TLC data → S3 bronze)
-python3 ingestion/ingest.py --months-back 1
+# 3. Ingest (downloads TLC parquet → S3 bronze)
+python3 ingestion/ingest.py --year 2024 --month 1
 
-# 4. Open Databricks, paste and run notebooks/01_bronze_to_silver.py
-# 5. Run notebooks/02_silver_to_gold.py
-# 6. Run Snowflake DDL: load/snowflake_setup.sql
-# 7. Run dbt
+# 4. Transform locally
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+export SPARK_DRIVER_MEMORY=4g
+python3 transform/bronze_to_silver.py
+python3 transform/silver_to_gold.py
+
+# 5. Upload gold to S3, then load into Snowflake
+aws s3 cp data/gold/ s3://your-bucket/gold/yellow_taxi/ --recursive
+# Run load/snowflake_setup.sql in a Snowflake worksheet
+
+# 6. Model and test with dbt
 cd dbt_project && dbt run && dbt test
 
-# 8. Connect Tableau Public to Snowflake → NYC_TAXI.MARTS.MART_DEMAND_INTELLIGENCE
+# 7. Tableau Public connects via CSV export (Tableau Public Desktop has no
+#    live Snowflake connector — export marts as CSV, then build dashboards)
 ```
+
+---
+
+## Honest scope notes
+
+This is a portfolio project built to demonstrate end-to-end pipeline ownership, not a production system. Three honest caveats: Tableau Public requires CSV exports rather than a live Snowflake connection (a Tableau Server/Desktop deployment would connect live); the orchestration is manual script execution rather than Airflow/a scheduler; and the dataset is a 3-month historical slice rather than a live daily feed. Every architectural decision above is written the way it would be defended for a production version of this system.
